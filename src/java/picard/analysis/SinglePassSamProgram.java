@@ -42,8 +42,26 @@ import picard.cmdline.Option;
 import picard.cmdline.StandardOptionDefinitions;
 
 import java.io.File;
+import java.lang.*;
+import java.lang.InterruptedException;
+import java.lang.Object;
+import java.lang.Override;
+import java.lang.Runnable;
+import java.lang.Runtime;
+import java.lang.System;
+import java.util.*;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
+import java.util.Collections;
+import java.util.List;
+import java.util.concurrent.*;
+import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.Semaphore;
+import java.util.concurrent.locks.Condition;
 
 /**
  * Super class that is designed to provide some consistent structure between subclasses that
@@ -64,9 +82,18 @@ public abstract class SinglePassSamProgram extends CommandLineProgram {
     public boolean ASSUME_SORTED = true;
 
     @Option(doc = "Stop after processing N reads, mainly for debugging.")
-    public long STOP_AFTER = 0;
+    public long STOP_AFTER = 30000000;
+
+    //Константа для максимального количества пар в очереди
+    public static final int MAX_PAIRS=50;
+    //Константа для максимального количества пар в очереди
+    public static final int QUEUE_CAPACITY=700;
+
+    //Poison pill
+    final static List<Object[]> PoisonPill= Collections.EMPTY_LIST;
 
     private static final Log log = Log.getInstance(SinglePassSamProgram.class);
+    final static ProgressLogger progress = new ProgressLogger(log);
 
     /**
      * Final implementation of doWork() that checks and loads the input and optionally reference
@@ -77,6 +104,7 @@ public abstract class SinglePassSamProgram extends CommandLineProgram {
         makeItSo(INPUT, REFERENCE_SEQUENCE, ASSUME_SORTED, STOP_AFTER, Arrays.asList(this));
         return 0;
     }
+
 
     public static void makeItSo(final File input,
                                 final File referenceSequence,
@@ -123,10 +151,17 @@ public abstract class SinglePassSamProgram extends CommandLineProgram {
             anyUseNoRefReads = anyUseNoRefReads || program.usesNoRefReads();
         }
 
+        //Объявление потоков
+        final ExecutorService service = Executors.newFixedThreadPool(Runtime.getRuntime().availableProcessors()/2);
+        //final ExecutorService service = Executors.newFixedThreadPool(Runtime.getRuntime().availableProcessors()-1);
+        //ExecutorService service = Executors.newCachedThreadPool();
 
-        final ProgressLogger progress = new ProgressLogger(log);
+        //Создание списка пар
+        List<Object[]> pairs = new ArrayList();
+        final Worker worker = new Worker();
 
         for (final SAMRecord rec : in) {
+
             final ReferenceSequence ref;
             if (walker == null || rec.getReferenceIndex() == SAMRecord.NO_ALIGNMENT_REFERENCE_INDEX) {
                 ref = null;
@@ -134,29 +169,54 @@ public abstract class SinglePassSamProgram extends CommandLineProgram {
                 ref = walker.get(rec.getReferenceIndex());
             }
 
-            for (final SinglePassSamProgram program : programs) {
-                program.acceptRead(rec, ref);
+            pairs.add(new Object[]{rec, ref});
+            //условие отсечения:набор пар
+            if (pairs.size() < MAX_PAIRS) {
+                continue;
             }
 
-            progress.record(rec);
+            while(!worker.submitData(pairs)){
+                try {
+                    Thread.sleep(125);
+                } catch (InterruptedException e) {
+                    e.printStackTrace();
+                }
+            }
 
-            // See if we need to terminate early?
+
+            worker.setInfo(programs, stopAfter, anyUseNoRefReads);
+
+            pairs = new ArrayList();
+            //Работа для потоков
+            /*service.execute(new Runnable() {
+                @Override
+                public void run() {
+                    while (true) {
+                        service.submit(worker);
+                    }
+                }
+            });
+            */
+
+            service.submit(worker);
+
+
             if (stopAfter > 0 && progress.getCount() >= stopAfter) {
-                break;
-            }
-
-            // And see if we're into the unmapped reads at the end
+               break;}
             if (!anyUseNoRefReads && rec.getReferenceIndex() == SAMRecord.NO_ALIGNMENT_REFERENCE_INDEX) {
-                break;
-            }
+                break;}
+
         }
 
+        worker.stop();
+        service.shutdown();
         CloserUtil.close(in);
 
         for (final SinglePassSamProgram program : programs) {
             program.finish();
         }
     }
+
 
     /** Can be overriden and set to false if the section of unmapped reads at the end of the file isn't needed. */
     protected boolean usesNoRefReads() { return true; }
@@ -173,5 +233,81 @@ public abstract class SinglePassSamProgram extends CommandLineProgram {
 
     /** Should be implemented by subclasses to do one-time finalization work. */
     protected abstract void finish();
+
+
+
+   static class Worker implements Runnable{
+        //Блокирующая очередь
+        BlockingQueue<List<Object[]>> queue = new LinkedBlockingQueue<>(QUEUE_CAPACITY);
+        Collection<SinglePassSamProgram> programs=null;
+       private Condition sufficientQueueMem;
+       private boolean check=true;
+       //Объявление семафора
+      // Semaphore sem = new Semaphore(2);
+
+        long stopAfter = 0;
+       boolean anyUseNoRefReads = false;
+
+        @Override
+        public void run() {
+
+
+            while(check) {
+                try{
+                List<Object[]> tmp = queue.take();
+
+                if (tmp.isEmpty()) {
+                    System.out.println("got the pill_1");
+                    check=false;
+                    return;}
+
+                for (Object[] obj : tmp) {
+                    SAMRecord rec = (SAMRecord) obj[0];
+                    ReferenceSequence ref = (ReferenceSequence) obj[1];
+
+                    for (final SinglePassSamProgram program : programs) {
+                        program.acceptRead(rec, ref);
+                    }
+                    progress.record(rec);
+                    if (stopAfter > 0 && progress.getCount() >= stopAfter) {
+                        break;
+                    }
+                    if (!anyUseNoRefReads && rec.getReferenceIndex() == SAMRecord.NO_ALIGNMENT_REFERENCE_INDEX) {
+                        break;
+                    }
+                }
+                } catch (InterruptedException ie) {
+                        ie.printStackTrace();
+                    }
+            }
+
+            }
+
+
+        public void setInfo (final Collection<SinglePassSamProgram> programs, long stopAfter,boolean anyUseNoRefReads) {
+            this.programs=programs;
+            this.stopAfter=stopAfter;
+            this.anyUseNoRefReads=anyUseNoRefReads;
+        }
+
+
+        public boolean submitData(List<Object[]> data){
+            try{
+
+               if (queue.remainingCapacity()==0) {
+                       System.out.println("Danger: queue is full on this record!");
+                   return false;}
+                //Попытка усыпить поток, пытающийся добавить в полную очередь элементы
+                //while(queue.remainingCapacity()==0) {sufficientQueueMem.await(2, TimeUnit.SECONDS);}
+                queue.put(data);
+            }catch (InterruptedException ie){ie.printStackTrace();}
+            return true;
+        }
+
+       public void stop(){
+           try {queue.put(PoisonPill);
+           }catch(InterruptedException ie) {ie.printStackTrace();}
+       }
+    }
 
 }
