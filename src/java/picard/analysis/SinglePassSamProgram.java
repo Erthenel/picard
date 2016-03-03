@@ -36,6 +36,7 @@ import htsjdk.samtools.util.IOUtil;
 import htsjdk.samtools.util.Log;
 import htsjdk.samtools.util.ProgressLogger;
 import htsjdk.samtools.util.SequenceUtil;
+import htsjdk.variant.variantcontext.writer.BCF2FieldEncoder;
 import picard.PicardException;
 import picard.cmdline.CommandLineProgram;
 import picard.cmdline.Option;
@@ -61,7 +62,10 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.Semaphore;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.locks.Condition;
+import java.util.concurrent.locks.Lock;
+import java.util.concurrent.locks.ReentrantLock;
 
 /**
  * Super class that is designed to provide some consistent structure between subclasses that
@@ -94,6 +98,11 @@ public abstract class SinglePassSamProgram extends CommandLineProgram {
 
     private static final Log log = Log.getInstance(SinglePassSamProgram.class);
     final static ProgressLogger progress = new ProgressLogger(log);
+
+    final static Lock readLock=new ReentrantLock();
+    final static Condition allowRead=readLock.newCondition();
+
+
 
     /**
      * Final implementation of doWork() that checks and loads the input and optionally reference
@@ -152,16 +161,16 @@ public abstract class SinglePassSamProgram extends CommandLineProgram {
         }
 
         //Объявление потоков
-        final ExecutorService service = Executors.newFixedThreadPool(Runtime.getRuntime().availableProcessors()/2);
-        //final ExecutorService service = Executors.newFixedThreadPool(Runtime.getRuntime().availableProcessors()-1);
-        //ExecutorService service = Executors.newCachedThreadPool();
+        final ExecutorService service = Executors.newFixedThreadPool(2);
 
         //Создание списка пар
         List<Object[]> pairs = new ArrayList();
         final Worker worker = new Worker();
+        worker.setInfo(programs, stopAfter, anyUseNoRefReads);
+         int counter=0;
 
         for (final SAMRecord rec : in) {
-
+            counter++;
             final ReferenceSequence ref;
             if (walker == null || rec.getReferenceIndex() == SAMRecord.NO_ALIGNMENT_REFERENCE_INDEX) {
                 ref = null;
@@ -175,41 +184,50 @@ public abstract class SinglePassSamProgram extends CommandLineProgram {
                 continue;
             }
 
-            while(!worker.submitData(pairs)){
-                try {
-                    Thread.sleep(125);
-                } catch (InterruptedException e) {
-                    e.printStackTrace();
-                }
-            }
 
+            //Избежание переполнения очереди (вместо busy wait)
+            readLock.lock();
+               try {
+                   while ((stopAfter<progress.getCount())|(worker.submitData(pairs) == false)) {
+                       allowRead.await();
+                   }
+               } catch (InterruptedException e) {
+                       e.printStackTrace();
+                   } finally {
+                   readLock.unlock();
+               }
+                service.submit(worker);
 
-            worker.setInfo(programs, stopAfter, anyUseNoRefReads);
 
             pairs = new ArrayList();
-            //Работа для потоков
-            /*service.execute(new Runnable() {
-                @Override
-                public void run() {
-                    while (true) {
-                        service.submit(worker);
-                    }
-                }
-            });
-            */
-
-            service.submit(worker);
-
 
             if (stopAfter > 0 && progress.getCount() >= stopAfter) {
-               break;}
+                 break;
+            }
             if (!anyUseNoRefReads && rec.getReferenceIndex() == SAMRecord.NO_ALIGNMENT_REFERENCE_INDEX) {
-                break;}
+                break;
+            }
 
         }
 
+        //Обработка конца
+        if (pairs.size() != 0) {
+            System.out.println(worker.submitData(pairs));
+            service.submit(worker);
+        }
+
         worker.stop();
+
         service.shutdown();
+        try {
+            service.awaitTermination(10,TimeUnit.SECONDS);
+        } catch (InterruptedException e) {
+            e.printStackTrace();
+        }
+
+
+
+        System.out.println("Total records: " + progress.getCount() + "!<-----");
         CloserUtil.close(in);
 
         for (final SinglePassSamProgram program : programs) {
@@ -240,25 +258,20 @@ public abstract class SinglePassSamProgram extends CommandLineProgram {
         //Блокирующая очередь
         BlockingQueue<List<Object[]>> queue = new LinkedBlockingQueue<>(QUEUE_CAPACITY);
         Collection<SinglePassSamProgram> programs=null;
-       private Condition sufficientQueueMem;
-       private boolean check=true;
-       //Объявление семафора
-      // Semaphore sem = new Semaphore(2);
-
         long stopAfter = 0;
        boolean anyUseNoRefReads = false;
 
         @Override
         public void run() {
-
-
-            while(check) {
                 try{
                 List<Object[]> tmp = queue.take();
+                    readLock.lock();
+                    try {
+                        allowRead.signalAll();
+                    } catch(Exception ie){ie.printStackTrace();}
+                    finally{readLock.unlock();}
 
                 if (tmp.isEmpty()) {
-                    System.out.println("got the pill_1");
-                    check=false;
                     return;}
 
                 for (Object[] obj : tmp) {
@@ -270,7 +283,7 @@ public abstract class SinglePassSamProgram extends CommandLineProgram {
                     }
                     progress.record(rec);
                     if (stopAfter > 0 && progress.getCount() >= stopAfter) {
-                        break;
+                         break;
                     }
                     if (!anyUseNoRefReads && rec.getReferenceIndex() == SAMRecord.NO_ALIGNMENT_REFERENCE_INDEX) {
                         break;
@@ -279,9 +292,15 @@ public abstract class SinglePassSamProgram extends CommandLineProgram {
                 } catch (InterruptedException ie) {
                         ie.printStackTrace();
                     }
-            }
+
+            readLock.lock();
+            try {
+                allowRead.signalAll();
+            } catch(Exception ie){ie.printStackTrace();}
+            finally{readLock.unlock();}
 
             }
+
 
 
         public void setInfo (final Collection<SinglePassSamProgram> programs, long stopAfter,boolean anyUseNoRefReads) {
@@ -292,20 +311,12 @@ public abstract class SinglePassSamProgram extends CommandLineProgram {
 
 
         public boolean submitData(List<Object[]> data){
-            try{
-
-               if (queue.remainingCapacity()==0) {
-                       System.out.println("Danger: queue is full on this record!");
-                   return false;}
-                //Попытка усыпить поток, пытающийся добавить в полную очередь элементы
-                //while(queue.remainingCapacity()==0) {sufficientQueueMem.await(2, TimeUnit.SECONDS);}
-                queue.put(data);
-            }catch (InterruptedException ie){ie.printStackTrace();}
-            return true;
+              return  queue.offer(data);
         }
 
        public void stop(){
-           try {queue.put(PoisonPill);
+           try {
+               queue.put(PoisonPill);
            }catch(InterruptedException ie) {ie.printStackTrace();}
        }
     }
