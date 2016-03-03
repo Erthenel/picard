@@ -144,7 +144,7 @@ public abstract class MultiLevelCollector<METRIC_TYPE extends MetricBase, Histog
         }
 
         /** Call acceptRecord(args) on the record collector identified by getKey */
-        public synchronized void acceptRecord(final ARGTYPE args, final SAMReadGroupRecord rg) {
+        public void acceptRecord(final ARGTYPE args, final SAMReadGroupRecord rg) {
 
             String key = UNKNOWN;
             if(rg != null) {
@@ -188,7 +188,7 @@ public abstract class MultiLevelCollector<METRIC_TYPE extends MetricBase, Histog
             return null;
         }
 
-        public synchronized void acceptRecord(final ARGTYPE args, final SAMReadGroupRecord rg) {
+        public void acceptRecord(final ARGTYPE args, final SAMReadGroupRecord rg) {
             allReadCollector.acceptRecord(args);
         }
 
@@ -308,7 +308,7 @@ public abstract class MultiLevelCollector<METRIC_TYPE extends MetricBase, Histog
      * Construct a argument of ARGTYPE using the given SAMRecord and ReferenceSequence then pass
      * this value to all collectors that should include this record
      */
-    public synchronized void acceptRecord(final SAMRecord record, final ReferenceSequence refSeq) {
+    public void acceptRecord(final SAMRecord record, final ReferenceSequence refSeq) {
         final ARGTYPE arg = makeArg(record, refSeq);
 
         for(final Distributor collector : outputOrderedDistributors) {

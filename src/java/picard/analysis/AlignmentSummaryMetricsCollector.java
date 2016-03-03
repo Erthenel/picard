@@ -226,7 +226,7 @@ public class AlignmentSummaryMetricsCollector extends SAMRecordAndReferenceMulti
                 }
             }
 
-            private void collectReadData(final SAMRecord record) {
+            private synchronized void collectReadData(final SAMRecord record) {
                 // NB: for read count metrics, do not include supplementary records, but for base count metrics, do include supplementary records.
                 if (record.getSupplementaryAlignmentFlag()) return;
 
@@ -274,7 +274,7 @@ public class AlignmentSummaryMetricsCollector extends SAMRecordAndReferenceMulti
                 }
             }
 
-            private void collectQualityData(final SAMRecord record, final ReferenceSequence reference) {
+            private synchronized void collectQualityData(final SAMRecord record, final ReferenceSequence reference) {
                 // NB: for read count metrics, do not include supplementary records, but for base count metrics, do include supplementary records.
 
                 // If the read isn't an aligned PF read then look at the read for no-calls
